@@ -1,0 +1,133 @@
+#!/usr/bin/env ruby
+
+# ################################
+#     LIBVERT HOOKS DISPATCHER 
+# ################################
+#
+# Copyright (C) SATO Taisuke <paina@paina.jp> 2014
+# Licensed under The BSD 2-Clause License
+# 
+# Usage: Place this script as $SYSCONFDIR/libvirt/hooks/{daemon,qemu,lxc,network} 
+#        and set executable. Symbolic link is good practice.
+#
+#        This script is hooked by libvert with 4 arguments and configuration
+#        information as XML from stdin.
+#
+#        This script is executed by like this. e.g. preparing QEMU guest starting:
+#            'path/to/libvirt/hooks/qemu guest_name prepare begin -'
+#
+#        1st argument is 'object', 2nd is 'operation', 3rd is 'sub-operation'
+#        and 4th is 'extra argument'. If there is none, '-' is set.
+#
+#        This script dispatch 'action' according to the arguments, and execute
+#        the action described as a Ruby method.
+#
+#        When executing action, XML from stdin is usable as REXML document.
+
+require 'rexml/document'
+
+# *** names of the 4 arguments ***
+ARGNAMES = [ :object, :operation, :sub_ope, :extra ]
+
+# *** This script is run as one of 4 command-line name ***
+CMDNAMES = [ :daemon, :qemu, :lxc, :network ]
+
+# *** Getting data from args and stdin ***
+CMD  = $0.to_sym # command-line name, one of CMDNAMES.
+DOC  = REXML::Document.new(STDIN.read) or
+  abort "Cannot parse XML"
+
+def get_stat
+  i = 0
+  stat = {}
+  c = ARGV.count; abort "# of arguments not 4, but #{c}" unless c == 4
+
+  ARGNAMES.each do | argname |
+    stat[argname] = ARGV[i]
+    i = i + 1
+  end
+
+  return stat
+end
+
+STAT = get_stat # Current status described arguments are converted into Hash obj.
+
+# *** Dispatching DB ***
+# It's a litthle hard to construct this DB...
+# This sample does action which makes NDP proxy on/off when QEMU guest run/stop.
+DB = \
+{
+  :daemon => nil, # When run as 'daemon' command, do nothing.
+  :qemu =>        # When run as 'qemu' command, there are 2 actions
+  [
+   { 
+     { :object => 'lassie', :sub_ope => 'begin' } => # When QEMU guest named 'lassie' run,
+     'Lassie.ndp_proxy(:on)'                         # make NDP proxy on
+   # ^^^^^^^^^^^^^^^^^^^^^^^ This is method name of which above conditions are met.
+   },
+   {
+     { :object => 'lassie', :sub_ope => 'stopped' } =>
+     'Lassie.ndp_proxy(:off)'
+   }
+  ],
+  :lxc => nil,    # Do nothing.
+  :network => nil # ditto.
+}
+
+# *** Action Definitions (as moduled methods) ***
+module Lassie
+  extend self
+
+  private
+  def dev
+    xpath = "/domain/devices/interface[@type='direct']/target/@dev"
+    DOC.elements[xpath].to_s or raise "Cannot parse XML"
+  end
+
+  public
+  def ndp_proxy(switch)
+    case switch
+    when :on then
+      ipcmd = %W| /sbin/ip -6 neigh add proxy 2001:db8::1:2:3 dev #{dev} |
+    when :off then
+      ipcmd = %W| /sbin/ip -6 neigh delete proxy 2001:db8::1:2:3 dev #{dev} |
+    else
+      raise "Something wrong on action description"
+    end
+    system(*ipcmd)
+  end
+end
+
+# *** main ***
+
+# action searching
+ret = true
+exit unless DB[CMD] # No entry for the command line
+
+DB[CMD].each do | e |
+  tmp_stat = STAT
+
+  e.each do | cond, act |
+    ARGNAMES.each do | argname |
+      unless cond[argname]
+        cond.delete(argname)
+        tmp_stat.delete(argname)
+      end
+    end
+
+    if cond == tmp_stat # Action which matches to the status found!!
+      begin
+        if act.class == Array
+          r = send(*act)
+        else
+          r = send(act)
+        end
+      rescue e
+        STDERR.puts e
+      end
+      ret = false unless r
+    end
+  end
+end
+
+exit(status=ret)
